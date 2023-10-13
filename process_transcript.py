@@ -1,21 +1,29 @@
 import os
-from dotenv import load_dotenv
-from openai import OpenAI
 import json
+import sys
+
+import openai
+from openai import OpenAI
+from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 import utils
-from utils import save_file
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 gpt_model = os.getenv("GPT_MODEL")
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=30, exp_base=2),
+    retry=retry_if_exception_type((openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError)),
+)
 def chat_completions_request(messages, model=gpt_model, json_mode=True, tools=None, tool_choice="auto"):
     api_params = {
         "model": model,
         "messages": messages,
-        "temperature": 0,
+        "temperature": 0
     }
 
     if json_mode:
@@ -31,21 +39,30 @@ def chat_completions_request(messages, model=gpt_model, json_mode=True, tools=No
 
 def process_transcript(transcript):
     prompts_path = os.getenv("PROMPTS_PATH")
+
+    if has_moderation_issues(transcript):
+        sys.exit(1)
+    else:
+        print('Moderation passed')
+
     messages = [
         {"role": "system", "content": utils.open_file(os.path.join(prompts_path, "system_prompt.txt"))},
         {"role": "user", "content": utils.open_file(os.path.join(prompts_path, "user_prompt_01.txt")) + transcript},
     ]
 
-    firts_response = chat_completions_request(messages)
     print("Information extracted... ⏰")
 
-    messages.append(firts_response)
-    info_object = json.loads(firts_response.content.strip())
+    first_response = chat_completions_request(messages)
+
+    messages.append(first_response)
+
+    info_object = json.loads(first_response.content.strip())
 
     messages.append({"role": "user", "content": utils.open_file(os.path.join(prompts_path, "user_prompt_02.txt"))})
 
-    print("Information analyzed... ⏰")
+    print("Information analyzed... 📈")
     second_response = chat_completions_request(messages)
+
     messages.append(second_response)
 
     json_to_append = json.loads(second_response.content.strip())
@@ -57,33 +74,33 @@ def process_transcript(transcript):
         json.dumps(info_object, indent=4)
     )
 
-    print("Information saved... 📁")
+    print("Information saved! 💾")
 
     messages.append({"role": "user",
                      "content": "Please schedule a follow-up call"
-                                "using the interview date extracted from the transcrtipt."})
+                                " using the interview date extracted from the transcript."})
 
     third_response = chat_completions_request(messages, tools=utils.get_follow_up_function_desc())
     messages.append(third_response)
 
-    tool_cals = third_response.tool_calls
+    tool_calls = third_response.tool_calls
 
-    if tool_cals:
-        for tool_cal in tool_cals:
-            function_message = tool_cal.function
+    if tool_calls:
+        for tool_call in tool_calls:
+            function_message = tool_call.function
 
             if function_message.name == 'schedule_follow_up':
                 args = json.loads(function_message.arguments)
 
                 function_response = utils.schedule_follow_up(
-                    interviewer=args.get('interviewer'),
-                    candidate=args.get('candidate'),
-                    interview_date=args.get('interview_date'),
-                    sentiment=args.get('sentiment'),
+                    interviewer=args.get("interviewer"),
+                    candidate=args.get("candidate"),
+                    interview_date=args.get("interview_date"),
+                    sentiment=args.get("sentiment")
                 )
 
                 messages.append({
-                    "tool_call_id": tool_cal.id,
+                    "tool_call_id": tool_call.id,
                     "role": "tool",
                     "name": function_message.name,
                     "content": function_response
@@ -91,17 +108,48 @@ def process_transcript(transcript):
 
                 fourth_response = chat_completions_request(messages, json_mode=False)
                 messages.append(fourth_response)
+
     else:
-        print("no function was called")
+        print("No function was called")
 
     utils.pretty_print_conversation(messages)
 
 
-if __name__ == "__main__":
-    directory_path = os.getenv("TRANSCRIPTS_PATH")
-    files = os.listdir(directory_path)  # List all files in the directory
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, exp_base=2, min=2, max=30),
+    retry=retry_if_exception_type((openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError))
+)
+def has_moderation_issues(text):
+    """
+    Send a moderation request to OpenAI.
 
-    for file in files:
+    Parameters
+    ----------
+        text (str): The text to moderate.
+    """
+
+    # Split the text into chunks
+    chunks = utils.split_text_advanced(text)
+
+    for chunk in chunks:
+        # Send the API request and return the model's response.
+        response = client.moderations.create(input=chunk)
+
+        # Extract the value of flagged to see if the chunk violates OpenAI's content policy
+        flagged = response.results[0].flagged
+        if flagged:
+            utils.format_moderation_response(response, chunk)
+            return True
+
+    return False
+
+
+if __name__ == "__main__":
+    directory_path = os.getenv('TRANSCRIPTS_PATH')
+    files = os.listdir(directory_path)
+
+    for file in files[:1]:
         if file.endswith(".txt"):
             file_path = os.path.join(directory_path, file)
 
